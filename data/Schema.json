@@ -1,0 +1,47 @@
+{
+  "Tables": {
+    "Profile": {
+      "UserID": {
+        "Type": "INT",
+        "NotNull": null,
+        "Default": null,
+        "Enum": null,
+        "Referance": {
+          "Table": "Users",
+          "Field": "ID",
+          "Type": "ONE"
+        }
+      },
+      "Data": {
+        "Type": "JSON",
+        "NotNull": null,
+        "Default": null,
+        "Enum": null,
+        "Referance": null
+      }
+    },
+    "Users": {
+      "ID": {
+        "Type": "INT",
+        "NotNull": null,
+        "Default": null,
+        "Enum": null,
+        "Referance": null
+      },
+      "Email": {
+        "Type": "EMAIL",
+        "NotNull": null,
+        "Default": null,
+        "Enum": null,
+        "Referance": null
+      },
+      "Password": {
+        "Type": "PASSWORD",
+        "NotNull": null,
+        "Default": null,
+        "Enum": null,
+        "Referance": null
+      }
+    }
+  }
+}

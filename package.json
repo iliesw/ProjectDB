@@ -1,0 +1,20 @@
+{
+  "name": "projectdb",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "serve": "bun run src/index.ts",
+    "dev": "bun --hot src/index.ts",
+    "dev:clean": "bun --hot --no-cache src/index.ts",
+    "clean": "rm -rf node_modules/.cache && rm -rf .bun",
+    "build": "bun build src/index.ts --outdir dist --target bun",
+    "start": "bun run dist/index.js"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}
