@@ -7,12 +7,7 @@ export const Users = Table("Users", {
 });
 
 export const Profile = Table("Profile", {
-  UserID: Int({
-    referance: {
-      Table: "Users",
-      Field: "ID",
-      Type: "ONE",
-    },
-  }),
+  UserID: Int().reference(() => [Users.ID]),
   Data: Json(),
 });
+

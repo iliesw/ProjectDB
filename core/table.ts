@@ -1,11 +1,12 @@
 import { FieldTypes } from "./types";
+import type { QueryOptions, UpdateOptions, DeleteOptions } from "./types";
 import { Database } from "./database";
 
 type SchemaField = {
-  Type: string;
+  Type: FieldTypes;
   NotNull: boolean;
   Enum?: any[];
-  Referance?: { Table: string; Field: string; Type: string };
+  Reference?: { Table: string; Field: string; Type: string };
 };
 type SchemaType = Record<string, SchemaField>;
 type TypeCheckerFn = (val: any) => boolean;
@@ -15,6 +16,11 @@ interface ExtendRelationship {
   myColumn: string;
   targetColumn: string;
   referenceType: string;
+}
+
+// Index interface for better query performance
+interface TableIndex {
+  [columnName: string]: Map<any, number[]>;
 }
 
 const TypeChecker: Record<string, TypeCheckerFn> = {
@@ -45,92 +51,81 @@ const TypeChecker: Record<string, TypeCheckerFn> = {
 const InsertChecker = (Values: Record<string, any>, Schema: SchemaType) => {
   const schemaKeys = Object.keys(Schema);
   const valueKeys = Object.keys(Values);
+  const schemaKeySet = new Set<string>(schemaKeys);
 
-  // Check for extra keys in Values not present in Schema
-  for (const key of valueKeys) {
-    if (!schemaKeys.includes(key)) {
-      return null;
-    }
+  // Fast check for extra keys
+  for (let i = 0; i < valueKeys.length; i++) {
+    const key = valueKeys[i];
+    if (typeof key !== "string" || !schemaKeySet.has(key)) return null;
   }
 
-  // Build the row to insert, filling missing keys with null or undefined
   const rowToInsert: Record<string, any> = {};
-  for (const key of schemaKeys) {
+
+  // Fill values
+  for (let i = 0; i < schemaKeys.length; i++) {
+    const key = schemaKeys[i];
+    // @ts-ignore
     const field = Schema[key];
-    if (!field) continue;
+    // @ts-ignore
     if (Object.prototype.hasOwnProperty.call(Values, key)) {
+    // @ts-ignore
       rowToInsert[key] = Values[key];
-    } else if (field.NotNull === false) {
+    } else if (field && field.NotNull === false) {
+    // @ts-ignore
       rowToInsert[key] = null;
     }
-    // If NotNull is true and value is missing, leave as undefined (will fail below)
   }
 
-  // Validate types and required fields
-  for (const key of schemaKeys) {
+  // Validate
+  for (let i = 0; i < schemaKeys.length; i++) {
+    const key = schemaKeys[i];
+    // @ts-ignore
     const field = Schema[key];
-    if (!field) continue;
+    if (!field) return false;
     const { Type, NotNull, Enum: EnumValues } = field;
+    // @ts-ignore
     const value = rowToInsert[key];
 
     if (value === undefined) {
       if (NotNull) return false;
       continue;
     }
+
     if (value === null) {
       if (NotNull) return false;
       continue;
     }
 
-    // Type check
     const checker = TypeChecker[Type];
     if (checker && !checker(value)) return false;
 
-    // Enum value check
-    if (field.Enum && Array.isArray(EnumValues)) {
-      if (!field.Enum.includes(value)) return false;
-    }
+    if (EnumValues && !EnumValues.includes(value)) return false;
   }
 
   return rowToInsert;
 };
 
 const UpdateChecker = (Values: Record<string, any>, Schema: SchemaType) => {
-  const schemaKeys = Object.keys(Schema);
+  const schemaKeySet = new Set<string>(Object.keys(Schema));
   const valueKeys = Object.keys(Values);
 
-  // Check for extra keys in Values not present in Schema
-  for (const key of valueKeys) {
-    if (!schemaKeys.includes(key)) {
-      return null;
-    }
-  }
+  for (let i = 0; i < valueKeys.length; i++) {
+    const key = valueKeys[i];
+    if (typeof key !== "string" || !schemaKeySet.has(key)) return null;
 
-  // Validate only the provided values (no NotNull checks for updates)
-  for (const key of valueKeys) {
     const field = Schema[key];
-    if (!field) continue;
-    const { Type, Enum: EnumValues } = field;
+    if (!field) return false;
     const value = Values[key];
+    if (value == null) continue; // skip undefined/null
 
-    // Skip validation for null/undefined values in updates
-    if (value === null || value === undefined) {
-      continue;
-    }
-
-    // Type check
-    const checker = TypeChecker[Type];
+    const checker = TypeChecker[field.Type];
     if (checker && !checker(value)) return false;
 
-    // Enum value check
-    if (field.Enum && Array.isArray(EnumValues)) {
-      if (!field.Enum.includes(value)) return false;
-    }
+    if (field.Enum && !field.Enum.includes(value)) return false;
   }
 
   return Values;
 };
-
 export class Table {
   Data: any[] = [];
   _Name: string;
@@ -138,13 +133,36 @@ export class Table {
   _Schema: any;
   // Add precalculated extend relationships
   _extendRelationships: Map<string, ExtendRelationship> = new Map();
+  // Add indexing for better performance
+  private _indexes: TableIndex = {};
+  private _indexDirty: Set<string> = new Set();
+
+  private _dirty: boolean = false;
+  private _changeCount: number = 0;
+  private _changeThreshold: number = 100; // customizable
+  private _autoSaveInterval: number = 5000; // 5 seconds
+  private _lastSaveTime: number = Date.now();
 
   constructor(name: string, path: string) {
     this._Name = name;
     this._Path = path;
-    // Don't auto-load in constructor since it's async
+    // Auto-save loop
+    setInterval(() => {
+      const now = Date.now();
+      if (
+        this._dirty &&
+        (now - this._lastSaveTime > this._autoSaveInterval ||
+          this._changeCount >= this._changeThreshold)
+      ) {
+        this.Save();
+      }
+    }, 1000); // check every second
   }
 
+  private markDirty() {
+    this._dirty = true;
+    this._changeCount++;
+  }
   // Add method to precalculate extend relationships
   private precalculateExtendRelationships(DBSchema: any): void {
     this._extendRelationships.clear();
@@ -153,18 +171,119 @@ export class Table {
       const TableFields = Object.keys(DBSchema.Tables[table]);
       TableFields.forEach((elem) => {
         if (
-          DBSchema.Tables[table][elem].Referance &&
-          DBSchema.Tables[table][elem].Referance.Table == this._Name
+          DBSchema.Tables[table][elem].Reference &&
+          DBSchema.Tables[table][elem].Reference.Table == this._Name
         ) {
           const relationship: ExtendRelationship = {
-            myColumn: DBSchema.Tables[table][elem].Referance.Field,
+            myColumn: DBSchema.Tables[table][elem].Reference.Field,
             targetColumn: elem,
-            referenceType: DBSchema.Tables[table][elem].Referance.Type || "ONE",
+            referenceType: DBSchema.Tables[table][elem].Reference.Type || "ONE",
           };
           this._extendRelationships.set(table, relationship);
         }
       });
     }
+  }
+
+  // Build indexes for better query performance
+  private buildIndexes(): void {
+    this._indexes = {};
+    this._indexDirty.clear();
+
+    if (!this._Schema) return;
+
+    const schemaKeys = Object.keys(this._Schema);
+
+    // Create indexes for all columns
+    for (const column of schemaKeys) {
+      this._indexes[column] = new Map();
+    }
+
+    // Populate indexes
+    for (let i = 0; i < this.Data.length; i++) {
+      const row = this.Data[i];
+      for (const column of schemaKeys) {
+        const value = row[column];
+        if (this._indexes[column]) {
+          if (!this._indexes[column].has(value)) {
+            this._indexes[column].set(value, []);
+          }
+          const indices = this._indexes[column].get(value);
+          if (indices) {
+            indices.push(i);
+          }
+        }
+      }
+    }
+  }
+
+  // Get rows by indexed column value
+  private getByIndex(column: string, value: any): number[] {
+    if (!this._indexes[column]) {
+      return [];
+    }
+    return this._indexes[column].get(value) || [];
+  }
+
+  // Update indexes when data changes
+  private updateIndexes(
+    operation: "insert" | "update" | "delete",
+    rowIndex: number,
+    oldValue?: any,
+    newValue?: any
+  ): void {
+    if (!this._Schema) return;
+
+    const schemaKeys = Object.keys(this._Schema);
+
+    for (const column of schemaKeys) {
+      if (operation === "insert") {
+        const value = this.Data[rowIndex]?.[column];
+        if (value !== undefined && this._indexes[column]) {
+          if (!this._indexes[column].has(value)) {
+            this._indexes[column].set(value, []);
+          }
+          const indices = this._indexes[column].get(value);
+          if (indices) {
+            indices.push(rowIndex);
+          }
+        }
+      } else if (operation === "update") {
+        // Remove old value
+        if (oldValue !== undefined && this._indexes[column]) {
+          const oldIndices = this._indexes[column].get(oldValue);
+          if (oldIndices) {
+            const index = oldIndices.indexOf(rowIndex);
+            if (index > -1) {
+              oldIndices.splice(index, 1);
+            }
+          }
+        }
+        // Add new value
+        if (newValue !== undefined && this._indexes[column]) {
+          if (!this._indexes[column].has(newValue)) {
+            this._indexes[column].set(newValue, []);
+          }
+          const indices = this._indexes[column].get(newValue);
+          if (indices) {
+            indices.push(rowIndex);
+          }
+        }
+      } else if (operation === "delete") {
+        const value = oldValue;
+        if (this._indexes[column]) {
+          const indices = this._indexes[column].get(value);
+          if (indices) {
+            const index = indices.indexOf(rowIndex);
+            if (index > -1) {
+              indices.splice(index, 1);
+            }
+          }
+        }
+      }
+    }
+
+    this.markDirty();
   }
 
   Load = async (DBSchema: string) => {
@@ -190,22 +309,27 @@ export class Table {
 
       // Precalculate extend relationships after loading data
       this.precalculateExtendRelationships(DBSchema);
+      // Build indexes after loading data
+      this.buildIndexes();
     } catch (error) {
       // If file is corrupted, start with empty array and recreate it
       this.Data = [];
       await this.Save();
       this.precalculateExtendRelationships(DBSchema);
+      this.buildIndexes();
     }
   };
 
   Save = async () => {
     try {
-      // Ensure the Tables directory exists by trying to write the file
-      // Bun will create the directory structure automatically if it doesn't exist
+      // Ensure the Tables directory exists
       const TableData = Bun.file(
         this._Path + "/Tables/" + this._Name + ".json"
       );
       await Bun.write(TableData, JSON.stringify(this.Data));
+      this._dirty = false;
+      this._changeCount = 0;
+      this._lastSaveTime = Date.now();
     } catch (error) {
       throw new Error(
         `Failed to save table '${this._Name}': ${
@@ -215,34 +339,38 @@ export class Table {
     }
   };
 
-  Get = ({
-    Columns,
-    Limit,
-    Offset,
-    Unique,
-    OrderBy,
-    Matches,
-    Extend,
-  }: {
-    Columns?: string[];
-    Limit?: number;
-    Offset?: number;
-    Unique?: boolean;
-    OrderBy?: {
-      Collumn: string;
-      Direction: "ASC" | "DESC";
-    };
-    Matches?: Record<string, any>;
-    Extend?: string[];
-  } = {}): any[] => {
-    // console.log(this._extendRelationships)
+  Get = (options: QueryOptions = {}): any[] => {
+    const { Columns, Limit, Offset, Unique, OrderBy, Matches, Extend } =
+      options;
+
     let result = Array.isArray(this.Data) ? [...this.Data] : [];
 
-    // Filter by condition if provided
+    // Use indexes for filtering if possible
     if (Matches && typeof Matches === "object") {
-      result = result.filter((row) =>
-        Object.entries(Matches).every(([key, value]) => row[key] === value)
-      );
+      const matchEntries = Object.entries(Matches);
+
+      // If we have a single match condition, try to use index
+      if (matchEntries.length === 1) {
+        const entry = matchEntries[0];
+        if (entry) {
+          const [key, value] = entry;
+          if (this._indexes[key]) {
+            const indices = this.getByIndex(key, value);
+            result = indices.map((index) => this.Data[index]);
+          } else {
+            // Fallback to linear search
+            result = result.filter((row) => row[key] === value);
+          }
+        }
+      } else {
+        // Multiple conditions, use linear search
+        result = result.filter((row) =>
+          matchEntries.every((entry) => {
+            const [key, value] = entry;
+            return row[key] === value;
+          })
+        );
+      }
     }
 
     // Select only specified columns if provided
@@ -268,9 +396,9 @@ export class Table {
     }
 
     // Order by column if provided
-    if (OrderBy && OrderBy.Collumn) {
+    if (OrderBy && OrderBy.Column) {
       result.sort((a, b) => {
-        const col = OrderBy.Collumn;
+        const col = OrderBy.Column;
         if (a[col] < b[col]) return OrderBy.Direction === "ASC" ? -1 : 1;
         if (a[col] > b[col]) return OrderBy.Direction === "ASC" ? 1 : -1;
         return 0;
@@ -281,18 +409,27 @@ export class Table {
     Extend?.forEach((table) => {
       const RelationDetail = this._extendRelationships.get(table);
       if (!RelationDetail) throw new Error("Extend Error : Relation Undefined");
-      result = result.map((old) => {
-        const Data = Database.Tables[table]?.Get({
-          Matches: {
-            [RelationDetail.targetColumn]: old[RelationDetail.myColumn],
-          },
-        });
 
-        let DataToAttach = null;
-        if (Data && Data.length !=0) {
-          DataToAttach = RelationDetail.referenceType == "ONE" ? Data[0] : Data;
+      const joinedTable = Database.Tables[table]?.Get(); // Fetch once
+      if (!joinedTable) {
+        return;
+      }
+      const joinMap = new Map();
+
+      for (const row of joinedTable) {
+        const key = row[RelationDetail.targetColumn];
+        if (RelationDetail.referenceType === "ONE") {
+          joinMap.set(key, row); // One-to-one
+        } else {
+          if (!joinMap.has(key)) joinMap.set(key, []);
+          joinMap.get(key).push(row); // One-to-many
         }
-        return { ...old, ["$"+table]: DataToAttach };
+      }
+
+      result = result.map((old) => {
+        const key = old[RelationDetail.myColumn];
+        const DataToAttach = joinMap.get(key) ?? null;
+        return { ...old, ["$" + table]: DataToAttach };
       });
     });
 
@@ -311,23 +448,20 @@ export class Table {
   Insert = async (Values: Record<string, any>, Options?: {}) => {
     const RowToInsert = InsertChecker(Values, this._Schema);
     if (RowToInsert) {
-      this.Data.push(RowToInsert);
-      await this.Save();
-      return RowToInsert;
+      const insertIndex = this.Data.length;
+      this.Data.push(Values);
+      this.updateIndexes("insert", insertIndex);
+
+      // await this.Save();
+      return Values;
     } else {
       throw new Error("Insert failed: Values do not match table schema.");
     }
   };
 
-  Delete = async ({
-    Matches,
-    Limit,
-    Offset,
-  }: {
-    Matches?: Record<string, any>;
-    Limit?: number;
-    Offset?: number;
-  } = {}): Promise<number> => {
+  Delete = async (options: DeleteOptions = {}): Promise<number> => {
+    const { Matches, Limit, Offset } = options;
+
     let itemsToDelete = [...this.Data];
 
     // Filter by condition if provided
@@ -358,9 +492,18 @@ export class Table {
 
     itemsToDelete = itemsToDelete.slice(safeOffset, safeLimit);
 
-    // Remove the filtered items from the original data
+    // Remove the filtered items from the original data and update indexes
     const deletedCount = itemsToDelete.length;
-    this.Data = this.Data.filter((row) => !itemsToDelete.includes(row));
+    for (const item of itemsToDelete) {
+      const index = this.Data.indexOf(item);
+      if (index !== -1) {
+        // Update indexes before removing
+        for (const column of Object.keys(this._Schema || {})) {
+          this.updateIndexes("delete", index, item[column]);
+        }
+        this.Data.splice(index, 1);
+      }
+    }
 
     // Save changes to disk
     await this.Save();
@@ -368,17 +511,9 @@ export class Table {
     return deletedCount;
   };
 
-  Update = async ({
-    Matches,
-    Values,
-    Limit,
-    Offset,
-  }: {
-    Matches?: Record<string, any>;
-    Values: Record<string, any>;
-    Limit?: number;
-    Offset?: number;
-  }): Promise<number> => {
+  Update = async (options: UpdateOptions): Promise<number> => {
+    const { Matches, Values, Limit, Offset } = options;
+
     // Validate that all keys in Matches exist in the schema
     if (Matches && typeof Matches === "object") {
       const schemaKeys = Object.keys(this._Schema || {});
@@ -435,6 +570,15 @@ export class Table {
       // Find the index of the item in the original data
       const index = this.Data.indexOf(item);
       if (index !== -1) {
+        // Update indexes for changed values
+        for (const entry of Object.entries(validatedValues)) {
+          const [key, newValue] = entry;
+          const oldValue = this.Data[index][key];
+          if (oldValue !== newValue) {
+            this.updateIndexes("update", index, oldValue, newValue);
+          }
+        }
+
         // Update the item with new values
         Object.assign(this.Data[index], validatedValues);
         updatedCount++;
