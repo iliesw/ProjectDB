@@ -1,6 +1,8 @@
 import { FieldTypes } from "./types";
 import type { QueryOptions, UpdateOptions, DeleteOptions } from "./types";
 import { Database } from "./database";
+import * as fs from "node:fs";
+import * as path from "node:path";
 
 type SchemaField = {
   Type: FieldTypes;
@@ -126,7 +128,7 @@ const UpdateChecker = (Values: Record<string, any>, Schema: SchemaType) => {
 
   return Values;
 };
-export class Table {
+export class OptimaTable {
   Data: any[] = [];
   _Name: string;
   _Path: string;
@@ -320,6 +322,33 @@ export class Table {
     }
   };
 
+  LoadSync(DBSchema: any): void {
+    try {
+      const tablesDir = path.join(this._Path, "Tables");
+      if (!fs.existsSync(tablesDir)) {
+        fs.mkdirSync(tablesDir, { recursive: true });
+      }
+      const tableFilePath = path.join(tablesDir, `${this._Name}.json`);
+
+      if (fs.existsSync(tableFilePath)) {
+        const raw = fs.readFileSync(tableFilePath, "utf8");
+        const data = JSON.parse(raw);
+        this.Data = Array.isArray(data) ? data : [];
+      } else {
+        this.Data = [];
+        this.SaveSync();
+      }
+
+      this.precalculateExtendRelationships(DBSchema);
+      this.buildIndexes();
+    } catch (_error) {
+      this.Data = [];
+      this.SaveSync();
+      this.precalculateExtendRelationships(DBSchema);
+      this.buildIndexes();
+    }
+  };
+
   Save = async () => {
     try {
       // Ensure the Tables directory exists
@@ -327,6 +356,26 @@ export class Table {
         this._Path + "/Tables/" + this._Name + ".json"
       );
       await Bun.write(TableData, JSON.stringify(this.Data));
+      this._dirty = false;
+      this._changeCount = 0;
+      this._lastSaveTime = Date.now();
+    } catch (error) {
+      throw new Error(
+        `Failed to save table '${this._Name}': ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`
+      );
+    }
+  };
+
+  SaveSync(): void {
+    try {
+      const tablesDir = require("path").join(this._Path, "Tables");
+      if (!require("fs").existsSync(tablesDir)) {
+        require("fs").mkdirSync(tablesDir, { recursive: true });
+      }
+      const tableFilePath = require("path").join(tablesDir, `${this._Name}.json`);
+      fs.writeFileSync(tableFilePath, JSON.stringify(this.Data));
       this._dirty = false;
       this._changeCount = 0;
       this._lastSaveTime = Date.now();

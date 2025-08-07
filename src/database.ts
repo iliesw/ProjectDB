@@ -1,14 +1,16 @@
-import { Table } from "./table";
+import { OptimaTable } from "./table";
 import { FieldTypes } from "./types";
-import type { DatabaseSchema, DatabaseConfig } from "./types";
+import type { DatabaseSchema } from "./types";
+import * as fs from "node:fs";
+import * as pathModule from "node:path";
 
 export { FieldTypes };
 
 interface DatabaseInstance {
   path: string;
   schema: DatabaseSchema | null;
-  Tables: { [key: string]: Table };
-  Migrate: (Tables: any) => Promise<void>;
+  Tables: { [key: string]: OptimaTable };
+  Sync: (Tables: any) => void;
 }
 
 export class DatabaseError extends Error {
@@ -29,13 +31,16 @@ export class Database {
   }
 
   /**
-   * Connect to a database at the specified path
+   * Connect to a database at the specified path (synchronous)
    * @param path Database path
-   * @returns Promise<DatabaseInstance>
+   * @returns DatabaseInstance
    */
-  static async Connect(path: string): Promise<DatabaseInstance> {
+  static Connect(path: string, Tables: any): DatabaseInstance {
     if (!path || typeof path !== "string") {
-      throw new DatabaseError("Database path must be a non-empty string", "INVALID_PATH");
+      throw new DatabaseError(
+        "Database path must be a non-empty string",
+        "INVALID_PATH"
+      );
     }
 
     const normalizedPath = this.normalizePath(path);
@@ -50,37 +55,50 @@ export class Database {
       path: normalizedPath,
       schema: null,
       Tables: {},
-      Migrate: async function (Tables: any): Promise<void> {
+      Sync: function (Tables: any): void {
         try {
-          await Bun.file(this.path + "/Schema.json").write(
-            JSON.stringify({ Tables: Tables })
-          );
-          await Database.loadSchema(instance);
-          await Database.loadTables(instance);
+          Database.ensureDirectories(instance.path);
+          const schemaFile = pathModule.join(instance.path, "Schema.json");
+          fs.writeFileSync(schemaFile, JSON.stringify({ Tables: Tables }));
+          Database.loadSchemaSync(instance);
+          Database.loadTablesSync(instance);
         } catch (error) {
           throw new DatabaseError(
-            `Migration failed: ${error instanceof Error ? error.message : "Unknown error"}`,
+            `Migration failed: ${
+              error instanceof Error ? error.message : "Unknown error"
+            }`,
             "MIGRATION_FAILED"
           );
         }
       },
     };
-
-    // Load schema and tables
-    await this.loadSchema(instance);
-    await this.loadTables(instance);
-
+    try {
+      Database.ensureDirectories(normalizedPath);
+      const schemaFile = pathModule.join(normalizedPath, "Schema.json");
+      fs.writeFileSync(schemaFile, JSON.stringify({ Tables: Tables }));
+      Database.loadSchemaSync(instance);
+      Database.loadTablesSync(instance);
+    } catch (error) {
+      throw new DatabaseError(
+        `Migration failed: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`,
+        "MIGRATION_FAILED"
+      );
+    }
     this._instance = instance;
-
     return instance;
   }
 
+  static Close():void {
+
+  }
+
   private static normalizePath(path: string): string {
-    // Normalize path to prevent issues with different path separators
     return path.replace(/[\\/]+/g, "/").replace(/\/$/, "");
   }
 
-  private static async loadSchema(instance: DatabaseInstance): Promise<void> {
+  private static loadSchemaSync(instance: DatabaseInstance): void {
     const CheckSchema = (Json: any): Json is DatabaseSchema => {
       if (!Json || typeof Json !== "object") {
         return false;
@@ -128,12 +146,16 @@ export class Database {
     };
 
     try {
-      const SchemaFile = Bun.file(instance.path + "/Schema.json");
-      if (!(await SchemaFile.exists())) {
-        throw new DatabaseError("Schema file does not exist", "SCHEMA_NOT_FOUND");
+      const schemaPath = pathModule.join(instance.path, "Schema.json");
+      if (!fs.existsSync(schemaPath)) {
+        throw new DatabaseError(
+          "Schema file does not exist",
+          "SCHEMA_NOT_FOUND"
+        );
       }
 
-      const JsonData = await SchemaFile.json();
+      const raw = fs.readFileSync(schemaPath, "utf8");
+      const JsonData = JSON.parse(raw);
       if (CheckSchema(JsonData)) {
         instance.schema = JsonData;
       } else {
@@ -152,17 +174,20 @@ export class Database {
     }
   }
 
-  private static async loadTables(instance: DatabaseInstance): Promise<void> {
+  private static loadTablesSync(instance: DatabaseInstance): void {
     if (!instance.schema || !instance.schema.Tables) {
-      throw new DatabaseError("Schema not loaded or invalid", "INVALID_SCHEMA_STATE");
+      throw new DatabaseError(
+        "Schema not loaded or invalid",
+        "INVALID_SCHEMA_STATE"
+      );
     }
 
     const STables = Object.keys(instance.schema.Tables);
     for (const table of STables) {
       try {
-        const tableInstance = new Table(table, instance.path);
+        const tableInstance = new OptimaTable(table, instance.path);
         tableInstance._Schema = instance.schema.Tables[table];
-        await tableInstance.Load(instance.schema as any);
+        tableInstance.LoadSync(instance.schema as any);
         instance.Tables[table] = tableInstance;
       } catch (error) {
         throw new DatabaseError(
@@ -184,7 +209,7 @@ export class Database {
     return this._instance ? this._instance.schema : null;
   }
 
-  static get Tables(): { [key: string]: Table } {
+  static get Tables(): { [key: string]: OptimaTable } {
     return this._instance ? this._instance.Tables : {};
   }
 
@@ -194,12 +219,34 @@ export class Database {
 
   static set _FlushInterval(value: number) {
     if (typeof value !== "number" || value < 0) {
-      throw new DatabaseError("Flush interval must be a positive number", "INVALID_FLUSH_INTERVAL");
+      throw new DatabaseError(
+        "Flush interval must be a positive number",
+        "INVALID_FLUSH_INTERVAL"
+      );
     }
     this._defaultFlushInterval = value;
   }
 
   static get _InstanceID(): number {
     return -1; // Legacy compatibility
+  }
+
+  private static ensureDirectories(rootPath: string): void {
+    try {
+      if (!fs.existsSync(rootPath)) {
+        fs.mkdirSync(rootPath, { recursive: true });
+      }
+      const tablesDir = pathModule.join(rootPath, "Tables");
+      if (!fs.existsSync(tablesDir)) {
+        fs.mkdirSync(tablesDir, { recursive: true });
+      }
+    } catch (error) {
+      throw new DatabaseError(
+        `Failed to ensure directories: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`,
+        "DIR_INIT_ERROR"
+      );
+    }
   }
 }
