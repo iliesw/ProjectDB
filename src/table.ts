@@ -1,17 +1,33 @@
 import { FieldTypes } from "./types";
-import type { QueryOptions, UpdateOptions, DeleteOptions } from "./types";
-import { Database } from "./database";
+import type { QueryOptions, UpdateOptions, DeleteOptions, RowFromColumns, InsertValues } from "./types";
 import * as fs from "node:fs";
-import * as path from "node:path";
+import * as pathModule from "node:path";
+const fsp = fs.promises;
 
 type SchemaField = {
   Type: FieldTypes;
-  NotNull: boolean;
+  NotNull?: boolean;
+  Default?: any;
   Enum?: any[];
   Reference?: { Table: string; Field: string; Type: string };
 };
 type SchemaType = Record<string, SchemaField>;
 type TypeCheckerFn = (val: any) => boolean;
+
+// Event system types
+type Listener<T> = (payload: T) => void;
+
+type TableEventMap<TRow> = {
+  insert: { row: RowFromColumns<TRow>; index: number };
+  update: {
+    before: RowFromColumns<TRow>;
+    after: RowFromColumns<TRow>;
+    index: number;
+    values: Partial<RowFromColumns<TRow>>;
+  };
+  delete: { row: RowFromColumns<TRow>; index: number };
+  get: { options: QueryOptions<RowFromColumns<TRow>>; result: RowFromColumns<TRow>[] };
+};
 
 // Add interface for precalculated extend relationships
 interface ExtendRelationship {
@@ -66,14 +82,13 @@ const InsertChecker = (Values: Record<string, any>, Schema: SchemaType) => {
   // Fill values
   for (let i = 0; i < schemaKeys.length; i++) {
     const key = schemaKeys[i];
-    // @ts-ignore
     const field = Schema[key];
-    // @ts-ignore
-    if (Object.prototype.hasOwnProperty.call(Values, key)) {
-    // @ts-ignore
+    const hasProvidedValue = Object.prototype.hasOwnProperty.call(Values, key);
+    if (hasProvidedValue) {
       rowToInsert[key] = Values[key];
+    } else if (field && field.Default !== undefined) {
+      rowToInsert[key] = field.Default;
     } else if (field && field.NotNull === false) {
-    // @ts-ignore
       rowToInsert[key] = null;
     }
   }
@@ -81,11 +96,9 @@ const InsertChecker = (Values: Record<string, any>, Schema: SchemaType) => {
   // Validate
   for (let i = 0; i < schemaKeys.length; i++) {
     const key = schemaKeys[i];
-    // @ts-ignore
     const field = Schema[key];
     if (!field) return false;
     const { Type, NotNull, Enum: EnumValues } = field;
-    // @ts-ignore
     const value = rowToInsert[key];
 
     if (value === undefined) {
@@ -118,7 +131,11 @@ const UpdateChecker = (Values: Record<string, any>, Schema: SchemaType) => {
     const field = Schema[key];
     if (!field) return false;
     const value = Values[key];
-    if (value == null) continue; // skip undefined/null
+    if (value === undefined) continue;
+    if (value === null) {
+      if (field.NotNull) return false;
+      continue;
+    }
 
     const checker = TypeChecker[field.Type];
     if (checker && !checker(value)) return false;
@@ -128,42 +145,158 @@ const UpdateChecker = (Values: Record<string, any>, Schema: SchemaType) => {
 
   return Values;
 };
-export class OptimaTable {
-  Data: any[] = [];
+export class OptimaTable<TColumns = any> {
+  Data: RowFromColumns<TColumns>[] = [];
   _Name: string;
   _Path: string;
   _Schema: any;
+  _TablesRef?: { [key: string]: OptimaTable };
   // Add precalculated extend relationships
   _extendRelationships: Map<string, ExtendRelationship> = new Map();
   // Add indexing for better performance
   private _indexes: TableIndex = {};
   private _indexDirty: Set<string> = new Set();
+  // Event listeners registry
+  private _listeners: Map<string, Set<Listener<any>>> = new Map();
 
   private _dirty: boolean = false;
   private _changeCount: number = 0;
   private _changeThreshold: number = 100; // customizable
-  private _autoSaveInterval: number = 5000; // 5 seconds
+  private _timeThresholdMs: number = 5000; // save if this much time elapsed since last save
   private _lastSaveTime: number = Date.now();
+  private _lastChangeTime: number = 0;
+  private _pendingSaveTimer: any | null = null;
 
   constructor(name: string, path: string) {
     this._Name = name;
     this._Path = path;
-    // Auto-save loop
-    setInterval(() => {
-      const now = Date.now();
-      if (
-        this._dirty &&
-        (now - this._lastSaveTime > this._autoSaveInterval ||
-          this._changeCount >= this._changeThreshold)
-      ) {
-        this.Save();
+    // Register a safe flush on process exit without using intervals
+    const flush = () => {
+      try {
+        if (this._dirty) {
+          this.SaveSync();
+        }
+      } catch (_) {
+        // best-effort on shutdown
       }
-    }, 1000); // check every second
+    };
+    // Use once for beforeExit and process signals
+    // These registrations are idempotent per instance lifetime
+    // and do not rely on any interval timers
+    // @ts-ignore Node/Bun environments expose process events
+    if (typeof process !== "undefined" && process && process.on) {
+      // beforeExit can run multiple times; keep minimal logic
+      process.once("beforeExit", flush);
+      process.once("exit", flush);
+      process.once("SIGINT", () => {
+        flush();
+        process.exit(0);
+      });
+      process.once("SIGTERM", () => {
+        flush();
+        process.exit(0);
+      });
+    }
   }
 
   private markDirty() {
     this._dirty = true;
     this._changeCount++;
+    this._lastChangeTime = Date.now();
+    this.scheduleTimeBasedSave();
+  }
+
+  // --- Events API ---
+  on<E extends keyof TableEventMap<TColumns> | (string & {})>(
+    event: E,
+    listener: Listener<E extends keyof TableEventMap<TColumns>
+      ? TableEventMap<TColumns>[E]
+      : any>
+  ): this {
+    const eventName = String(event);
+    if (!this._listeners.has(eventName)) this._listeners.set(eventName, new Set());
+    this._listeners.get(eventName)!.add(listener as Listener<any>);
+    return this;
+  }
+
+  once<E extends keyof TableEventMap<TColumns> | (string & {})>(
+    event: E,
+    listener: Listener<E extends keyof TableEventMap<TColumns>
+      ? TableEventMap<TColumns>[E]
+      : any>
+  ): this {
+    const eventName = String(event);
+    const onceWrapper = (payload: any) => {
+      try {
+        (listener as Listener<any>)(payload);
+      } finally {
+        this.off(eventName, onceWrapper);
+      }
+    };
+    return this.on(eventName, onceWrapper);
+  }
+
+  off<E extends keyof TableEventMap<TColumns> | (string & {})>(
+    event: E,
+    listener?: Listener<E extends keyof TableEventMap<TColumns>
+      ? TableEventMap<TColumns>[E]
+      : any>
+  ): this {
+    const eventName = String(event);
+    if (!this._listeners.has(eventName)) return this;
+    if (!listener) {
+      this._listeners.delete(eventName);
+      return this;
+    }
+    this._listeners.get(eventName)!.delete(listener as Listener<any>);
+    if (this._listeners.get(eventName)!.size === 0) {
+      this._listeners.delete(eventName);
+    }
+    return this;
+  }
+
+  emit<E extends keyof TableEventMap<TColumns> | (string & {})>(
+    event: E,
+    payload: E extends keyof TableEventMap<TColumns>
+      ? TableEventMap<TColumns>[E]
+      : any
+  ): void {
+    const eventName = String(event);
+    const listeners = this._listeners.get(eventName);
+    if (!listeners || listeners.size === 0) return;
+    // Call listeners safely; a throw in a listener should not break the DB flow
+    for (const listener of Array.from(listeners)) {
+      try {
+        (listener as Listener<any>)(payload);
+      } catch (_) {
+        // swallow listener errors to keep core ops stable
+      }
+    }
+  }
+  
+  // Smart save: called after data-changing operations to persist based on thresholds
+  private async checkAutoSave(force: boolean = false): Promise<void> {
+    if (!this._dirty && !force) return;
+    const now = Date.now();
+    const countReached = this._changeCount >= this._changeThreshold;
+    const timeReached = now - this._lastSaveTime >= this._timeThresholdMs;
+    if (force || countReached || timeReached) {
+      await this.Save();
+    }
+  }
+
+  // Schedule a one-shot timer capped by time-threshold since last save
+  private scheduleTimeBasedSave(): void {
+    if (!this._dirty) return;
+    if (this._pendingSaveTimer) return;
+    const now = Date.now();
+    const elapsedSinceLastSave = now - this._lastSaveTime;
+    const delay = Math.max(0, this._timeThresholdMs - elapsedSinceLastSave);
+    this._pendingSaveTimer = setTimeout(() => {
+      this._pendingSaveTimer = null;
+      // Force to ensure it saves even if count is small
+      void this.checkAutoSave(true);
+    }, delay);
   }
   // Add method to precalculate extend relationships
   private precalculateExtendRelationships(DBSchema: any): void {
@@ -228,60 +361,50 @@ export class OptimaTable {
   }
 
   // Update indexes when data changes
-  private updateIndexes(
+  private updateIndexForColumn(
     operation: "insert" | "update" | "delete",
+    column: string,
     rowIndex: number,
     oldValue?: any,
     newValue?: any
   ): void {
     if (!this._Schema) return;
+    if (!this._indexes[column]) return;
 
-    const schemaKeys = Object.keys(this._Schema);
-
-    for (const column of schemaKeys) {
-      if (operation === "insert") {
-        const value = this.Data[rowIndex]?.[column];
-        if (value !== undefined && this._indexes[column]) {
-          if (!this._indexes[column].has(value)) {
-            this._indexes[column].set(value, []);
-          }
-          const indices = this._indexes[column].get(value);
-          if (indices) {
-            indices.push(rowIndex);
-          }
+    if (operation === "insert") {
+      const value = this.Data[rowIndex]?.[column];
+      if (value !== undefined) {
+        if (!this._indexes[column].has(value)) {
+          this._indexes[column].set(value, []);
         }
-      } else if (operation === "update") {
-        // Remove old value
-        if (oldValue !== undefined && this._indexes[column]) {
-          const oldIndices = this._indexes[column].get(oldValue);
-          if (oldIndices) {
-            const index = oldIndices.indexOf(rowIndex);
-            if (index > -1) {
-              oldIndices.splice(index, 1);
-            }
-          }
+        const indices = this._indexes[column].get(value);
+        if (indices) {
+          indices.push(rowIndex);
         }
-        // Add new value
-        if (newValue !== undefined && this._indexes[column]) {
-          if (!this._indexes[column].has(newValue)) {
-            this._indexes[column].set(newValue, []);
-          }
-          const indices = this._indexes[column].get(newValue);
-          if (indices) {
-            indices.push(rowIndex);
-          }
+      }
+    } else if (operation === "update") {
+      if (oldValue !== undefined) {
+        const oldIndices = this._indexes[column].get(oldValue);
+        if (oldIndices) {
+          const idx = oldIndices.indexOf(rowIndex);
+          if (idx > -1) oldIndices.splice(idx, 1);
         }
-      } else if (operation === "delete") {
-        const value = oldValue;
-        if (this._indexes[column]) {
-          const indices = this._indexes[column].get(value);
-          if (indices) {
-            const index = indices.indexOf(rowIndex);
-            if (index > -1) {
-              indices.splice(index, 1);
-            }
-          }
+      }
+      if (newValue !== undefined) {
+        if (!this._indexes[column].has(newValue)) {
+          this._indexes[column].set(newValue, []);
         }
+        const indices = this._indexes[column].get(newValue);
+        if (indices) {
+          indices.push(rowIndex);
+        }
+      }
+    } else if (operation === "delete") {
+      const value = oldValue;
+      const indices = this._indexes[column].get(value);
+      if (indices) {
+        const idx = indices.indexOf(rowIndex);
+        if (idx > -1) indices.splice(idx, 1);
       }
     }
 
@@ -290,23 +413,18 @@ export class OptimaTable {
 
   Load = async (DBSchema: string) => {
     try {
-      const TableData = Bun.file(
-        this._Path + "/Tables/" + this._Name + ".json"
-      );
+      const tablesDir = pathModule.join(this._Path, "Tables");
+      const tableFilePath = pathModule.join(tablesDir, `${this._Name}.json`);
 
-      // Check if file exists
-      if (await TableData.exists()) {
-        const data = await TableData.json();
-        // Validate that data is an array
-        if (Array.isArray(data)) {
-          this.Data = data;
-        } else {
-          this.Data = [];
-        }
-      } else {
-        // Create the file with empty array if it doesn't exist
-        await this.Save();
+      try {
+        await fsp.mkdir(tablesDir, { recursive: true });
+        const raw = await fsp.readFile(tableFilePath, "utf8");
+        const data = JSON.parse(raw);
+        this.Data = Array.isArray(data) ? data : [];
+      } catch (readErr: any) {
+        // If file does not exist or is corrupted, reset and save
         this.Data = [];
+        await this.Save();
       }
 
       // Precalculate extend relationships after loading data
@@ -324,11 +442,11 @@ export class OptimaTable {
 
   LoadSync(DBSchema: any): void {
     try {
-      const tablesDir = path.join(this._Path, "Tables");
+      const tablesDir = pathModule.join(this._Path, "Tables");
       if (!fs.existsSync(tablesDir)) {
         fs.mkdirSync(tablesDir, { recursive: true });
       }
-      const tableFilePath = path.join(tablesDir, `${this._Name}.json`);
+      const tableFilePath = pathModule.join(tablesDir, `${this._Name}.json`);
 
       if (fs.existsSync(tableFilePath)) {
         const raw = fs.readFileSync(tableFilePath, "utf8");
@@ -351,14 +469,17 @@ export class OptimaTable {
 
   Save = async () => {
     try {
-      // Ensure the Tables directory exists
-      const TableData = Bun.file(
-        this._Path + "/Tables/" + this._Name + ".json"
-      );
-      await Bun.write(TableData, JSON.stringify(this.Data));
+      const tablesDir = pathModule.join(this._Path, "Tables");
+      const tableFilePath = pathModule.join(tablesDir, `${this._Name}.json`);
+      await fsp.mkdir(tablesDir, { recursive: true });
+      await fsp.writeFile(tableFilePath, JSON.stringify(this.Data));
       this._dirty = false;
       this._changeCount = 0;
       this._lastSaveTime = Date.now();
+      if (this._pendingSaveTimer) {
+        clearTimeout(this._pendingSaveTimer);
+        this._pendingSaveTimer = null;
+      }
     } catch (error) {
       throw new Error(
         `Failed to save table '${this._Name}': ${
@@ -370,15 +491,19 @@ export class OptimaTable {
 
   SaveSync(): void {
     try {
-      const tablesDir = require("path").join(this._Path, "Tables");
-      if (!require("fs").existsSync(tablesDir)) {
-        require("fs").mkdirSync(tablesDir, { recursive: true });
+      const tablesDir = pathModule.join(this._Path, "Tables");
+      if (!fs.existsSync(tablesDir)) {
+        fs.mkdirSync(tablesDir, { recursive: true });
       }
-      const tableFilePath = require("path").join(tablesDir, `${this._Name}.json`);
+      const tableFilePath = pathModule.join(tablesDir, `${this._Name}.json`);
       fs.writeFileSync(tableFilePath, JSON.stringify(this.Data));
       this._dirty = false;
       this._changeCount = 0;
       this._lastSaveTime = Date.now();
+      if (this._pendingSaveTimer) {
+        clearTimeout(this._pendingSaveTimer);
+        this._pendingSaveTimer = null;
+      }
     } catch (error) {
       throw new Error(
         `Failed to save table '${this._Name}': ${
@@ -388,7 +513,7 @@ export class OptimaTable {
     }
   };
 
-  Get = (options: QueryOptions = {}): any[] => {
+  Get = (options: QueryOptions<RowFromColumns<TColumns>> = {}): RowFromColumns<TColumns>[] => {
     const { Columns, Limit, Offset, Unique, OrderBy, Matches, Extend } =
       options;
 
@@ -459,7 +584,7 @@ export class OptimaTable {
       const RelationDetail = this._extendRelationships.get(table);
       if (!RelationDetail) throw new Error("Extend Error : Relation Undefined");
 
-      const joinedTable = Database.Tables[table]?.Get(); // Fetch once
+      const joinedTable = this._TablesRef?.[table]?.Get(); // Fetch once
       if (!joinedTable) {
         return;
       }
@@ -489,26 +614,33 @@ export class OptimaTable {
       safeLimit = safeOffset + Limit;
     }
 
-    result = result.slice(safeOffset, safeLimit);
+    const out = result.slice(safeOffset, safeLimit);
 
-    return result;
+    // Emit get event
+    this.emit("get", { options: options as any, result: out as any });
+
+    return out;
   };
 
-  Insert = async (Values: Record<string, any>, Options?: {}) => {
-    const RowToInsert = InsertChecker(Values, this._Schema);
+  Insert = async (Values: InsertValues<RowFromColumns<TColumns>>, Options?: {}): Promise<RowFromColumns<TColumns>> => {
+    const RowToInsert = InsertChecker(Values as Record<string, any>, this._Schema) as unknown as RowFromColumns<TColumns> | null | false;
     if (RowToInsert) {
       const insertIndex = this.Data.length;
-      this.Data.push(Values);
-      this.updateIndexes("insert", insertIndex);
-
-      // await this.Save();
-      return Values;
+      this.Data.push(RowToInsert);
+      // update indexes per column
+      for (const column of Object.keys(this._Schema || {})) {
+        this.updateIndexForColumn("insert", column, insertIndex);
+      }
+      // Emit insert event
+      this.emit("insert", { row: RowToInsert as any, index: insertIndex });
+      await this.checkAutoSave();
+      return RowToInsert;
     } else {
       throw new Error("Insert failed: Values do not match table schema.");
     }
   };
 
-  Delete = async (options: DeleteOptions = {}): Promise<number> => {
+  Delete = async (options: DeleteOptions<RowFromColumns<TColumns>> = {}): Promise<number> => {
     const { Matches, Limit, Offset } = options;
 
     let itemsToDelete = [...this.Data];
@@ -546,21 +678,23 @@ export class OptimaTable {
     for (const item of itemsToDelete) {
       const index = this.Data.indexOf(item);
       if (index !== -1) {
-        // Update indexes before removing
+        // Update indexes before removing per column
         for (const column of Object.keys(this._Schema || {})) {
-          this.updateIndexes("delete", index, item[column]);
+          this.updateIndexForColumn("delete", column, index, item[column]);
         }
         this.Data.splice(index, 1);
+        // Emit delete event
+        this.emit("delete", { row: item as any, index });
       }
     }
 
-    // Save changes to disk
-    await this.Save();
+    // Smart save based on thresholds
+    await this.checkAutoSave();
 
     return deletedCount;
   };
 
-  Update = async (options: UpdateOptions): Promise<number> => {
+  Update = async (options: UpdateOptions<RowFromColumns<TColumns>>): Promise<number> => {
     const { Matches, Values, Limit, Offset } = options;
 
     // Validate that all keys in Matches exist in the schema
@@ -619,23 +753,31 @@ export class OptimaTable {
       // Find the index of the item in the original data
       const index = this.Data.indexOf(item);
       if (index !== -1) {
-        // Update indexes for changed values
+        const beforeSnapshot = { ...(this.Data[index] as any) } as RowFromColumns<TColumns>;
+        // Update indexes for changed values per column
         for (const entry of Object.entries(validatedValues)) {
-          const [key, newValue] = entry;
+          const [key, newValue] = entry as [string, any];
           const oldValue = this.Data[index][key];
           if (oldValue !== newValue) {
-            this.updateIndexes("update", index, oldValue, newValue);
+            this.updateIndexForColumn("update", key, index, oldValue, newValue);
           }
         }
 
         // Update the item with new values
         Object.assign(this.Data[index], validatedValues);
+        // Emit update event
+        this.emit("update", {
+          before: beforeSnapshot as any,
+          after: this.Data[index] as any,
+          index,
+          values: validatedValues as any,
+        });
         updatedCount++;
       }
     }
 
-    // Save changes to disk
-    await this.Save();
+    // Smart save based on thresholds
+    await this.checkAutoSave();
 
     return updatedCount;
   };

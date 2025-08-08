@@ -12,6 +12,41 @@ export enum FieldTypes {
   Password = "PASSWORD", // Hashed password ********************* ✅
 }
 
+// Type-level helpers for IntelliSense
+import type { FieldObject } from "./schema";
+
+export type ColumnType<T> = T extends FieldObject<infer V, any, any>
+  ? V
+  : never;
+
+type RequiredKeys<TColumns> = {
+  [K in keyof TColumns]-?: TColumns[K] extends FieldObject<
+    any,
+    infer TNotNull,
+    infer THasDefault
+  >
+    ? TNotNull extends false
+      ? never
+      : THasDefault extends true
+        ? never
+        : K
+    : never;
+}[keyof TColumns];
+
+type OptionalKeys<TColumns> = Exclude<keyof TColumns, RequiredKeys<TColumns>>;
+
+type ColumnValue<T> = T extends FieldObject<infer V, infer TNotNull, any>
+  ? TNotNull extends false
+    ? V | null
+    : V
+  : never;
+
+export type RowFromColumns<TColumns> = {
+  [K in RequiredKeys<TColumns>]: ColumnValue<TColumns[K]>;
+} & {
+  [K in OptionalKeys<TColumns>]?: ColumnValue<TColumns[K]>;
+};
+
 export interface DatabaseSchema {
   Tables: Record<string, TableSchema>;
 }
@@ -39,28 +74,30 @@ export interface DatabaseConfig {
   flushInterval?: number;
 }
 
-export interface QueryOptions {
-  Columns?: string[];
+export interface QueryOptions<TRow = any> {
+  Columns?: (keyof TRow)[];
   Limit?: number;
   Offset?: number;
   Unique?: boolean;
   OrderBy?: {
-    Column: string;
+    Column: keyof TRow & string;
     Direction: "ASC" | "DESC";
   };
-  Matches?: Record<string, any>;
+  Matches?: Partial<TRow>;
   Extend?: string[];
 }
 
-export interface UpdateOptions {
-  Matches?: Record<string, any>;
-  Values: Record<string, any>;
+export interface UpdateOptions<TRow = any> {
+  Matches?: Partial<TRow>;
+  Values: Partial<TRow>;
   Limit?: number;
   Offset?: number;
 }
 
-export interface DeleteOptions {
-  Matches?: Record<string, any>;
+export interface DeleteOptions<TRow = any> {
+  Matches?: Partial<TRow>;
   Limit?: number;
   Offset?: number;
-} 
+}
+
+export type InsertValues<TRow> = TRow;

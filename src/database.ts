@@ -6,13 +6,6 @@ import * as pathModule from "node:path";
 
 export { FieldTypes };
 
-interface DatabaseInstance {
-  path: string;
-  schema: DatabaseSchema | null;
-  Tables: { [key: string]: OptimaTable };
-  Sync: (Tables: any) => void;
-}
-
 export class DatabaseError extends Error {
   constructor(message: string, public code?: string) {
     super(message);
@@ -20,64 +13,37 @@ export class DatabaseError extends Error {
   }
 }
 
-export class Database {
-  private static _instance: DatabaseInstance | null = null;
+export class Database<TTables extends Record<string, any> = Record<string, any>> {
   private static _defaultFlushInterval: number = 10000; // 10 seconds
-
-  constructor() {
-    throw new Error(
-      "Database class cannot be instantiated. Use Database.Connect() instead."
-    );
-  }
+  public path: string;
+  public schema: DatabaseSchema | null = null;
+  public Tables: { [K in keyof TTables]: OptimaTable<TTables[K]> } =
+    {} as any;
 
   /**
-   * Connect to a database at the specified path (synchronous)
-   * @param path Database path
-   * @returns DatabaseInstance
+   * Create a database instance at the specified path (synchronous)
+   * and initialize schema/tables.
    */
-  static Connect(path: string, Tables: any): DatabaseInstance {
+  constructor(path: string, Tables: TTables) {
     if (!path || typeof path !== "string") {
       throw new DatabaseError(
         "Database path must be a non-empty string",
         "INVALID_PATH"
       );
     }
-
-    const normalizedPath = this.normalizePath(path);
-
-    // Return existing instance if already connected
-    if (this._instance) {
-      return this._instance;
-    }
-
-    // Create new instance
-    const instance: DatabaseInstance = {
-      path: normalizedPath,
-      schema: null,
-      Tables: {},
-      Sync: function (Tables: any): void {
-        try {
-          Database.ensureDirectories(instance.path);
-          const schemaFile = pathModule.join(instance.path, "Schema.json");
-          fs.writeFileSync(schemaFile, JSON.stringify({ Tables: Tables }));
-          Database.loadSchemaSync(instance);
-          Database.loadTablesSync(instance);
-        } catch (error) {
-          throw new DatabaseError(
-            `Migration failed: ${
-              error instanceof Error ? error.message : "Unknown error"
-            }`,
-            "MIGRATION_FAILED"
-          );
-        }
-      },
-    };
+    const normalizedPath = Database.normalizePath(path);
+    this.path = normalizedPath;
     try {
-      Database.ensureDirectories(normalizedPath);
-      const schemaFile = pathModule.join(normalizedPath, "Schema.json");
+      Database.ensureDirectories(this.path);
+      const schemaFile = pathModule.join(this.path, "Schema.json");
       fs.writeFileSync(schemaFile, JSON.stringify({ Tables: Tables }));
-      Database.loadSchemaSync(instance);
-      Database.loadTablesSync(instance);
+      this.loadSchemaSync();
+      this.loadTablesSync();
+      // Wire table references for joins
+      Object.values(this.Tables as any).forEach((t: OptimaTable) => {
+        // @ts-ignore - internal wiring
+        t._TablesRef = this.Tables;
+      });
     } catch (error) {
       throw new DatabaseError(
         `Migration failed: ${
@@ -86,19 +52,34 @@ export class Database {
         "MIGRATION_FAILED"
       );
     }
-    this._instance = instance;
-    return instance;
   }
 
-  static Close():void {
-
+  Sync(Tables: TTables): void {
+    try {
+      Database.ensureDirectories(this.path);
+      const schemaFile = pathModule.join(this.path, "Schema.json");
+      fs.writeFileSync(schemaFile, JSON.stringify({ Tables: Tables }));
+      this.loadSchemaSync();
+      this.loadTablesSync();
+      Object.values(this.Tables as any).forEach((t: OptimaTable) => {
+        // @ts-ignore - internal wiring
+        t._TablesRef = this.Tables;
+      });
+    } catch (error) {
+      throw new DatabaseError(
+        `Migration failed: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`,
+        "MIGRATION_FAILED"
+      );
+    }
   }
 
   private static normalizePath(path: string): string {
     return path.replace(/[\\/]+/g, "/").replace(/\/$/, "");
   }
 
-  private static loadSchemaSync(instance: DatabaseInstance): void {
+  private loadSchemaSync(): void {
     const CheckSchema = (Json: any): Json is DatabaseSchema => {
       if (!Json || typeof Json !== "object") {
         return false;
@@ -146,7 +127,7 @@ export class Database {
     };
 
     try {
-      const schemaPath = pathModule.join(instance.path, "Schema.json");
+      const schemaPath = pathModule.join(this.path, "Schema.json");
       if (!fs.existsSync(schemaPath)) {
         throw new DatabaseError(
           "Schema file does not exist",
@@ -157,7 +138,7 @@ export class Database {
       const raw = fs.readFileSync(schemaPath, "utf8");
       const JsonData = JSON.parse(raw);
       if (CheckSchema(JsonData)) {
-        instance.schema = JsonData;
+        this.schema = JsonData;
       } else {
         throw new DatabaseError("Invalid schema format", "INVALID_SCHEMA");
       }
@@ -174,21 +155,21 @@ export class Database {
     }
   }
 
-  private static loadTablesSync(instance: DatabaseInstance): void {
-    if (!instance.schema || !instance.schema.Tables) {
+  private loadTablesSync(): void {
+    if (!this.schema || !this.schema.Tables) {
       throw new DatabaseError(
         "Schema not loaded or invalid",
         "INVALID_SCHEMA_STATE"
       );
     }
 
-    const STables = Object.keys(instance.schema.Tables);
+    const STables = Object.keys(this.schema.Tables);
     for (const table of STables) {
       try {
-        const tableInstance = new OptimaTable(table, instance.path);
-        tableInstance._Schema = instance.schema.Tables[table];
-        tableInstance.LoadSync(instance.schema as any);
-        instance.Tables[table] = tableInstance;
+        const tableInstance = new OptimaTable<any>(table, this.path);
+        tableInstance._Schema = this.schema.Tables[table];
+        tableInstance.LoadSync(this.schema as any);
+        (this.Tables as any)[table] = tableInstance as OptimaTable<any>;
       } catch (error) {
         throw new DatabaseError(
           `Failed to load table '${table}': ${
@@ -198,19 +179,6 @@ export class Database {
         );
       }
     }
-  }
-
-  // Legacy static methods for backward compatibility
-  static get _Path(): string {
-    return this._instance ? this._instance.path : "";
-  }
-
-  static get _Schema(): DatabaseSchema | null {
-    return this._instance ? this._instance.schema : null;
-  }
-
-  static get Tables(): { [key: string]: OptimaTable } {
-    return this._instance ? this._instance.Tables : {};
   }
 
   static get _FlushInterval(): number {
@@ -225,10 +193,6 @@ export class Database {
       );
     }
     this._defaultFlushInterval = value;
-  }
-
-  static get _InstanceID(): number {
-    return -1; // Legacy compatibility
   }
 
   private static ensureDirectories(rootPath: string): void {
